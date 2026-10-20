@@ -1,0 +1,17 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["cmd/bridge-target", "cmd/bridge-cli"],
+  "locale": "zh-CN",
+  "canonicalMap": "DESIGN.md",
+  "requiredCapabilities": [],
+  "requiredCommands": ["unit", "vet", "build"],
+  "commands": {
+    "unit": "go test ./...",
+    "vet": "go vet ./...",
+    "build": "powershell -File scripts/build.ps1"
+  },
+  "evidence": {
+    "failurePaths": "cmd/bridge-target/gui_controller_test.go",
+    "nativePreview": "build/_validation/gui-ready.png"
+  }
+}

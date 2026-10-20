@@ -1,0 +1,7 @@
+{
+  "version": "9.8.1.0",
+  "architecture": "amd64",
+  "archive": "OpenSSH-Win64.zip",
+  "sha256": "PUT_THE_VENDOR_SHA256_HEX_DIGEST_HERE",
+  "min_build": 17763
+}

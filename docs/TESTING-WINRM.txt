@@ -1,0 +1,62 @@
+﻿Remote Bridge 0.2.9-test.1 / Windows 局域网测试版
+
+两端一起更新，整个 RemoteBridge 目录一起使用；保留 packages\openssh。
+默认 WinRM 当前账号托管连接；SSH 继续保留。真实双机验收仍待完成。
+WinRM 本次入口有效期为 3 小时，从目标端配置开始计时，复用不会续期。
+本版需要更新两端并重新打开；已有窗口和连接保持原期限，不会自动延长。
+保留前版管理员窗口查询及命令参数的修复；SSH 路径仍为 30 分钟。
+连接权限以目标实际登录令牌为准，目标配置窗口经过 UAC 不会自动给会话管理员权限。
+
+一、目标电脑
+1. 接入与管理电脑相同的可信局域网。
+2. 双击 bridge-target.exe，核对当前账号、主机和地址。
+3. 点击配置按钮，确认修改并允许必要的标准 Windows UAC。
+4. 保持窗口打开。“正在广播”表示等待，认证成功后才显示连接成功。
+   如果 UAC 使用另一个管理员账号，请核对提升后的公告账号；不符合预期时停止。
+   本版本没有完成 UAC 前原用户身份的可靠交接。
+
+二、管理电脑
+1. 双击 bridge-cli.exe；或在 PowerShell 运行：
+   .\bridge-cli.exe manage --discover --target <目标IP>
+   多个目标时需要指定 IP。首次精确 TrustedHosts 准备可能请求标准 Windows UAC。
+2. 在原生密码窗口中输入目标公告账号的 Windows 密码，不是 Hello PIN。
+   不要把密码发到聊天、脚本或命令参数。输入一次后保持管理窗口打开。
+3. 连接成功后核对电脑和账号，点击“复制 Codex 交接指令”，发到 Codex 聊天。
+   Codex 可直接使用 CLI；一次性配置 MCP 后也可用 bridge_status / bridge_execute。
+   当前已打开的 Codex 会话未必能即时加载新增 MCP，CLI 可以直接使用。
+4. 手工检查：
+   .\bridge-cli.exe session list
+   .\bridge-cli.exe session status --id <rb-会话编号>
+   .\bridge-cli.exe session exec --id <rb-会话编号> --command "hostname; whoami; Get-Date" --json
+   每条命令使用独立 PowerShell，默认超时 30 秒，可设 1–120 秒。
+   不能在两条命令之间保留变量、目录或模块。只支持非交互命令。
+5. 在管理窗口点击“结束连接”，或运行：
+   .\bridge-cli.exe session close --id <rb-会话编号>
+   重新连接需要重新输入密码。关闭目标入口则在目标窗口点击“结束连接”。
+
+三、本版双机验收清单
+1. 错误密码显示失败；正确密码只输入一次，连续两次命令均使用同一账号。
+2. 目标窗口从“正在广播”变为“连接成功”；管理端正常断开后回到等待。
+3. 运行短时 Start-Sleep 时结束目标入口，验证命令中止；旧会话拒绝新命令。
+4. 验证入口到期、管理端关闭/异常退出、普通账号权限和清理失败反馈。
+5. 核对管理端 %LOCALAPPDATA%\RemoteBridge\audit.jsonl 中逐条命令和结束事件。
+6. 杀毒防护保持开启。若脚本被隔离，记录安全软件、检测名称、文件路径和版本，
+   不关闭防护、不添加排除项、不恢复未经核对的隔离脚本。反馈时不要提供密码。
+
+四、边界和排障
+1. 新版托管连接需要目标端活动入口校验；旧包不能满足本版托管验证。
+   目标窗口每秒写入受保护的状态文件。普通远程账号无需查询管理员进程。
+   正常结束立即使入口失效；目标窗口被强制关闭后，状态最多 5 秒过期。
+2. 目标端结束会撤销本工具的托管入口，不会删除账号原有的 WinRM 权限或 listener。
+3. 运行中的托管命令检查期限和入口，并使用 Windows Job 回收进程树；
+   已执行的文件/系统修改不会自动回滚，交给外部服务的工作也不保证撤回。
+4. 管理端突然断电时目标窗口状态可能滞后；不能用旧的“成功”文字判断在线。
+5. 普通账号缺少 WinRM 权限时仍可能被拒绝；不要关闭 UAC 限制或自行扩权。
+6. 目标日志通常在程序旁 logs\bridge-target.jsonl，实际位置以窗口显示为准。
+   清理错误请保留诊断。反馈版本、Windows 版本、提升前后账号和错误文字。
+7. 兼容 winrm/exec/shell 命令保留，需要另行输入密码，不具有新版托管入口校验。
+
+保留的 SSH 测试：
+目标机：.\bridge-target.exe gui --ssh
+管理机：.\bridge-cli.exe ssh --discover --command "Get-Date; hostname; whoami"
+首次 SSH 配对由目标用户确认，详见 REMOTE-BRIDGE-SSH.md。
