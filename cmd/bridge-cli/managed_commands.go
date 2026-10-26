@@ -23,7 +23,7 @@ func runSession(args []string) int {
 	timeout := 30
 	jsonOutput := false
 	fs.StringVar(&id, "id", "", "托管会话编号")
-	fs.StringVar(&command, "command", "", "远程 PowerShell 命令")
+	fs.StringVar(&command, "command", "", "远程 Shell 命令；按会话使用 PowerShell 或 POSIX sh")
 	fs.IntVar(&timeout, "timeout", 30, "命令超时秒数，1–120")
 	fs.BoolVar(&jsonOutput, "json", false, "输出 JSON")
 	if err := fs.Parse(args[1:]); err != nil {

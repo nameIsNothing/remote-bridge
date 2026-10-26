@@ -208,9 +208,11 @@ func discoveryFirewallApplyScript(o NormalizedOptions) string {
 }
 
 func discoveryFirewallRevokeScript(o NormalizedOptions) string {
+	// SilentlyContinue does not reliably suppress terminating provider errors.
+	// Only the exact missing-rule result is a successful repeated cleanup.
 	rule := psQuote(discoveryFirewallRuleName(o))
 	marker := psQuote(discoveryFirewallMarker(o))
-	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $rules = @(Get-NetFirewallRule -DisplayName %s -ErrorAction SilentlyContinue); if ($rules.Count -eq 0) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } else { $owned = @($rules | Where-Object { $_.Description -eq %s }); $unowned = @($rules | Where-Object { $_.Description -ne %s }); if ($unowned.Count -gt 0) { throw 'at least one same-name discovery firewall rule is not owned by this plan; no rule was removed' }; foreach ($r in $owned) { Remove-NetFirewallRule -InputObject $r }; [pscustomobject]@{ removed = $true; count = $owned.Count; display_name = %s } | ConvertTo-Json -Compress }`, rule, marker, marker, rule)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $rules = @(); try { $rules = @(Get-NetFirewallRule -DisplayName %s -ErrorAction Stop) } catch { if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound -or ([string]$_.FullyQualifiedErrorId -split ',')[0] -ne 'CmdletizationQuery_NotFound_DisplayName') { throw } }; if ($rules.Count -eq 0) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } else { $owned = @($rules | Where-Object { $_.Description -eq %s }); $unowned = @($rules | Where-Object { $_.Description -ne %s }); if ($unowned.Count -gt 0) { throw 'at least one same-name discovery firewall rule is not owned by this plan; no rule was removed' }; foreach ($r in $owned) { Remove-NetFirewallRule -InputObject $r -ErrorAction Stop }; [pscustomobject]@{ removed = $true; count = $owned.Count; display_name = %s } | ConvertTo-Json -Compress }`, rule, marker, marker, rule)
 }
 
 func winRMFirewallCheckScript(o NormalizedOptions) string {
@@ -290,13 +292,13 @@ func accountGroupApplyScript(o NormalizedOptions) string {
 func accountRevokeScript(o NormalizedOptions) string {
 	user := psQuote(o.TemporaryUser)
 	marker := psQuote("Remote Bridge temporary account " + o.ID)
-	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $u = Get-LocalUser -Name %s -ErrorAction SilentlyContinue; if ($null -eq $u) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } elseif ($u.Description -eq %s) { Remove-LocalUser -Name %s -Confirm:$false; [pscustomobject]@{ removed = $true; name = %s } | ConvertTo-Json -Compress } else { throw 'the account exists but is not owned by this plan; it was left untouched' }`, user, marker, user, user)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $u = $null; try { $u = Get-LocalUser -Name %s -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound -or ([string]$_.FullyQualifiedErrorId -split ',')[0] -ne 'UserNotFound') { throw } }; if ($null -eq $u) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } elseif ($u.Description -eq %s) { Remove-LocalUser -Name %s -Confirm:$false -ErrorAction Stop; [pscustomobject]@{ removed = $true; name = %s } | ConvertTo-Json -Compress } else { throw 'the account exists but is not owned by this plan; it was left untouched' }`, user, marker, user, user)
 }
 
 func firewallRevokeScript(o NormalizedOptions) string {
 	rule := psQuote(o.FirewallRule)
 	marker := psQuote("Remote Bridge plan " + o.ID)
-	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $rules = @(Get-NetFirewallRule -DisplayName %s -ErrorAction SilentlyContinue); if ($rules.Count -eq 0) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } else { $owned = @($rules | Where-Object { $_.Description -eq %s }); $unowned = @($rules | Where-Object { $_.Description -ne %s }); if ($unowned.Count -gt 0) { throw 'at least one same-name firewall rule is not owned by this plan; no rule was removed' }; foreach ($r in $owned) { Remove-NetFirewallRule -InputObject $r }; [pscustomobject]@{ removed = $true; count = $owned.Count; display_name = %s } | ConvertTo-Json -Compress }`, rule, marker, marker, rule)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $rules = @(); try { $rules = @(Get-NetFirewallRule -DisplayName %s -ErrorAction Stop) } catch { if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound -or ([string]$_.FullyQualifiedErrorId -split ',')[0] -ne 'CmdletizationQuery_NotFound_DisplayName') { throw } }; if ($rules.Count -eq 0) { [pscustomobject]@{ removed = $false; reason = 'already absent' } | ConvertTo-Json -Compress } else { $owned = @($rules | Where-Object { $_.Description -eq %s }); $unowned = @($rules | Where-Object { $_.Description -ne %s }); if ($unowned.Count -gt 0) { throw 'at least one same-name firewall rule is not owned by this plan; no rule was removed' }; foreach ($r in $owned) { Remove-NetFirewallRule -InputObject $r -ErrorAction Stop }; [pscustomobject]@{ removed = $true; count = $owned.Count; display_name = %s } | ConvertTo-Json -Compress }`, rule, marker, marker, rule)
 }
 
 // Inspect runs only actions marked ReadOnly. The report is returned even if

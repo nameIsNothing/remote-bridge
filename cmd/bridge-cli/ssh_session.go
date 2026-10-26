@@ -17,13 +17,23 @@ import (
 
 	"remote-bridge/internal/discovery"
 	"remote-bridge/internal/sshclient"
+	"remote-bridge/internal/unixssh"
 )
 
 const (
+	// Legacy Windows SSH and uncommitted staging directories keep their
+	// original limit. Unix approvals share the target's current policy.
 	sshSessionLifetime = 30 * time.Minute
 	sshSessionLockWait = 3 * time.Second
 	sshSessionVersion  = 1
 )
+
+func sshSessionLifetimeForShell(shell string) time.Duration {
+	if shell == "posix" {
+		return unixssh.MaxLifetime
+	}
+	return sshSessionLifetime
+}
 
 var (
 	errSSHSessionBusy     = errors.New("该目标已有一个管理端命令或交互会话正在运行，请结束后重试")
@@ -41,6 +51,7 @@ type sshSessionRecord struct {
 	Port          int       `json:"port"`
 	DiscoveryPort int       `json:"discovery_port"`
 	Username      string    `json:"username"`
+	Shell         string    `json:"shell,omitempty"`
 	ManagerID     string    `json:"manager_id"`
 	PublicKey     string    `json:"public_key"`
 	HostKey       string    `json:"host_key"`
@@ -187,7 +198,7 @@ func (s *lockedSSHSession) readRecord() (sshSessionRecord, error) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return sshSessionRecord{}, errors.New("SSH 会话缓存包含额外数据")
 	}
-	if record.Version != sshSessionVersion || record.InstanceID != s.instance || record.CreatedAt.IsZero() || record.ExpiresAt.IsZero() || !record.ExpiresAt.After(record.CreatedAt) || record.ExpiresAt.After(record.CreatedAt.Add(sshSessionLifetime)) {
+	if record.Version != sshSessionVersion || record.InstanceID != s.instance || (record.Shell != "" && record.Shell != "posix") || record.CreatedAt.IsZero() || record.ExpiresAt.IsZero() || !record.ExpiresAt.After(record.CreatedAt) || record.ExpiresAt.After(record.CreatedAt.Add(sshSessionLifetimeForShell(record.Shell))) {
 		return sshSessionRecord{}, errors.New("SSH 会话缓存的实例或有效期异常，请使用 --forget-session 清除后重试")
 	}
 	if !s.cache.now().Before(record.ExpiresAt) {
@@ -305,7 +316,7 @@ func canonicalSSHKey(value string) (string, error) {
 }
 
 func (s *lockedSSHSession) validateBinding(record sshSessionRecord, selected discovery.Announcement, endpoint *net.UDPAddr, username string) error {
-	if record.InstanceID != selected.InstanceID || record.Address != endpoint.IP.String() || record.Port != selected.Port || record.DiscoveryPort != endpoint.Port || !strings.EqualFold(record.Username, selected.Username) || (username != "" && !strings.EqualFold(record.Username, username)) {
+	if record.InstanceID != selected.InstanceID || record.Address != endpoint.IP.String() || record.Port != selected.Port || record.DiscoveryPort != endpoint.Port || record.Shell != selected.Shell || !sameSSHUsername(record.Shell, record.Username, selected.Username) || (username != "" && !sameSSHUsername(record.Shell, record.Username, username)) {
 		return errors.New("目标实例、地址、端口或账号与已批准的会话不一致；拒绝沿用旧授权，请检查目标后使用 --forget-session")
 	}
 	if record.ManagerID == "" || strings.ContainsAny(record.ManagerID, "\r\n\x00") {
@@ -344,7 +355,7 @@ func (s *lockedSSHSession) validateBinding(record sshSessionRecord, selected dis
 // refreshes the approval lifetime or replaces a pinned host key. Successful
 // pairing is saved before SSH starts, including when that SSH attempt fails.
 func (s *lockedSSHSession) authorize(ctx context.Context, selected discovery.Announcement, endpoint *net.UDPAddr, username string, pair sshPairFunc, keygen sshKeygenFunc) (record sshSessionRecord, reused bool, returnErr error) {
-	if endpoint == nil || endpoint.IP.To4() == nil || selected.InstanceID != s.instance || selected.Expired(s.cache.now()) {
+	if endpoint == nil || endpoint.IP.To4() == nil || selected.InstanceID != s.instance || (selected.Shell != "" && selected.Shell != "posix") || selected.Expired(s.cache.now()) {
 		return record, false, errors.New("SSH 目标实例、地址或有效期无效")
 	}
 	username = strings.TrimSpace(username)
@@ -375,8 +386,8 @@ func (s *lockedSSHSession) authorize(ctx context.Context, selected discovery.Ann
 			return record, false, err
 		}
 		created := s.cache.now()
-		record = sshSessionRecord{Version: sshSessionVersion, InstanceID: selected.InstanceID, Address: endpoint.IP.String(), Port: selected.Port, DiscoveryPort: endpoint.Port, Username: selected.Username, ManagerID: managerID, PublicKey: publicKey, CreatedAt: created, ExpiresAt: earlierSSHExpiry(created.Add(sshSessionLifetime), selected.ExpiresAt)}
-		if username != "" && !strings.EqualFold(username, selected.Username) {
+		record = sshSessionRecord{Version: sshSessionVersion, InstanceID: selected.InstanceID, Address: endpoint.IP.String(), Port: selected.Port, DiscoveryPort: endpoint.Port, Username: selected.Username, Shell: selected.Shell, ManagerID: managerID, PublicKey: publicKey, CreatedAt: created, ExpiresAt: earlierSSHExpiry(created.Add(sshSessionLifetimeForShell(selected.Shell)), selected.ExpiresAt)}
+		if username != "" && !sameSSHUsername(record.Shell, username, selected.Username) {
 			return record, false, errors.New("指定的 SSH 用户名与目标公告不一致")
 		}
 		response, err := s.requestPair(ctx, record, pair)
@@ -444,7 +455,7 @@ func (s *lockedSSHSession) requestPair(ctx context.Context, record sshSessionRec
 }
 
 func (s *lockedSSHSession) acceptResponse(record *sshSessionRecord, response discovery.PairResponse, reused bool) error {
-	if response.Port != record.Port || !strings.EqualFold(response.Username, record.Username) || !s.cache.now().Before(response.ExpiresAt) {
+	if response.Port != record.Port || response.Shell != record.Shell || !sameSSHUsername(record.Shell, response.Username, record.Username) || !s.cache.now().Before(response.ExpiresAt) {
 		return errors.New("SSH 配对响应的端口、账号或有效期与目标入口不一致")
 	}
 	hostKey, err := canonicalSSHKey(response.HostKey)
@@ -460,6 +471,13 @@ func (s *lockedSSHSession) acceptResponse(record *sshSessionRecord, response dis
 		return errSSHSessionExpired
 	}
 	return nil
+}
+
+func sameSSHUsername(shell, a, b string) bool {
+	if shell == "posix" {
+		return a == b
+	}
+	return strings.EqualFold(a, b)
 }
 
 func earlierSSHExpiry(a, b time.Time) time.Time {

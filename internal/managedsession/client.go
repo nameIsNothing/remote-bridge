@@ -209,6 +209,9 @@ func List(ctx context.Context, root string) ([]Info, error) {
 	return items, nil
 }
 func Handoff(info Info, program string) string {
+	if info.Transport == "ssh" {
+		return fmt.Sprintf("使用 Remote Bridge SSH 托管会话 %s（%s，账号 %s，UID %s，Shell 为 POSIX sh，有效至 %s）。先查看会话状态，再按我的请求操作。已配置 MCP 时使用 bridge_status / bridge_execute；否则用程序 %q 的 session status / session exec --id %s 子命令。不要索取密码或另建连接。每条命令使用独立 Shell，权限保持为该账号。", info.ID, info.Hostname, info.Username, info.UID, info.ExpiresAt.Local().Format("15:04:05"), program, info.ID)
+	}
 	return fmt.Sprintf("使用 Remote Bridge 托管会话 %s（%s，账号 %s，有效至 %s）。先查看会话状态，再按我的请求操作。已配置 MCP 时使用 bridge_status / bridge_execute；否则用程序 %q 的 session status / session exec --id %s 子命令。不要索取密码，也不要另建 WinRM 连接。", info.ID, info.Hostname, info.Username, info.ExpiresAt.Local().Format("15:04:05"), program, info.ID)
 }
 

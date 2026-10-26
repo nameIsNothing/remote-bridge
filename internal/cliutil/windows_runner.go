@@ -38,6 +38,8 @@ func (r PasswordRunner) Run(ctx context.Context, command windows.Command) (windo
 	}
 	started := time.Now()
 	process := exec.CommandContext(ctx, command.Program, command.Args...)
+	// This captured, non-interactive helper needs EOF, not a NUL device.
+	process.Stdin = strings.NewReader("")
 	configurePasswordHelper(process)
 	process.Env = withEnvironmentValue(os.Environ(), r.EnvName, r.Password)
 	var stdout, stderr bytes.Buffer

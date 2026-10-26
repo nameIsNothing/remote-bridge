@@ -1,0 +1,107 @@
+Remote Bridge 两端 0.3.1-test.1 / Linux、macOS SSH
+
+本包包含 darwin-amd64、darwin-arm64、linux-amd64、linux-arm64 两端程序。
+macOS 使用 Darwin 包；Intel Mac 对应 amd64，Apple Silicon 对应 arm64。
+已有 Intel/macOS12.7.6 与 ARM64/macOS26.6.2 基本连接通过记录；
+本版3小时期限与省略首次Y的完整真机验收仍须按开发交接记录区分。
+Mac 通过不代表 Linux 通过。目标机不需要 Go、Node 或 Python。
+
+一、U 盘目录与启动
+1. 将完整 unix 目录复制到 U 盘 RemoteBridge/unix，保留 SHA256SUMS 和四个平台目录。
+   Windows 发布文件及已有 logs 目录可继续保留在 RemoteBridge 根目录。
+2. Mac 双击 unix/Start.command，Terminal 中将显示检查和连接流程。
+   exFAT 或解压工具可能丢失启动文件执行权限；此时在 Terminal 运行：
+   sh "/Volumes/<U盘卷名>/RemoteBridge/unix/Start.command"
+   Linux 在终端运行：
+   sh "/media/<用户>/<U盘卷名>/RemoteBridge/unix/start-unix.sh"
+   实际挂载路径可能不同；路径有空格时保留双引号。
+3. 启动器会按系统/架构选包，将本平台两个程序复制到本机临时目录，
+   仅校验这两个固定文件的 SHA-256，再设置本机副本执行权限。
+   U 盘即使挂载为 noexec，仍可通过上述 sh 入口启动；不会直接执行 U 盘二进制。
+4. 若本机 /tmp 也为 noexec，可选一个自己有权写入且允许执行的本机目录：
+   REMOTE_BRIDGE_TMPDIR="/本机可执行目录" sh "/U盘路径/unix/start-unix.sh"
+   该目录须已存在；不要将它指回 U 盘。系统安全策略仍可能阻止执行。
+5. macOS 首次打开若提示来源或安全限制，请按系统正常授权流程处理。
+   本工具不会自动清除 quarantine、关闭 Gatekeeper 或请求完整磁盘访问。
+   ZIP 显式记录 Unix 执行权限，但 Finder 双击是否可用仍需真实 U 盘测试。
+
+二、目标机确认
+1. 用日常登录账号启动，接入与管理机相同的可信局域网。
+2. 核对主机、账号、局域网 IP。程序使用系统 /usr/sbin/sshd；
+   若未安装 OpenSSH server，请按系统正常方式准备后重试，程序不自动安装。
+3. 打开启动器即开始准备，省略启动时第一次 y，窗口会显示版本和修改说明。
+   需要权限时程序调用正常 sudo 提示，在目标机本地输入管理员密码。
+   不要把密码发到聊天、脚本或参数。远程 Shell 仍是原登录账号，未自动提升权限。
+   普通命令行直接运行 bridge-target ssh 仍要求完整确认；EOF/读取失败取消。
+   启动器的 --start 模式必须有交互式终端，后台/管道会被拒绝，不自动开入口。
+4. 本次入口默认 TCP 2222、UDP 37020，最长 3 小时，从本次目标开启计算，复用不续期。
+   两端要一起更新并重新开启；已运行旧窗口不会自动延长。旧Windows SSH仍30分钟。
+   它使用独立临时 sshd、主机密钥和授权文件，不改原有账号、authorized_keys、
+   系统 SSH 配置、远程登录开关或防火墙。系统策略阻止访问时先保留错误，
+   不自行关闭防火墙或放宽到公网。
+   test.2 修复 test.1 在 /var/tmp 下创建授权文件导致 StrictModes 拒绝公钥的问题。
+   新运行目录位于 macOS /private/var、Linux /var/lib 的本次随机子目录；
+   启动前校验整条父目录链由 root 拥有、禁止组/其他用户写入且普通账号可遍历。
+   不修改既有系统目录权限，不关闭 StrictModes；不满足条件时直接报错退出。
+5. 管理端首次请求时，核对其主机、来源 IP 和公钥指纹，输入 y 或 Y 允许。
+   只批准认识的管理端。拒绝、过期、EOF 均不授权；相同公钥/来源/实例复用原期限。
+6. 保持目标终端打开。没有待确认请求时按回车结束，或正常关闭终端。
+   到期、结束和异常退出分别核验；不能凭“已结束”文字推断全部回收已完成。
+
+三、Windows 管理机和 Codex
+1. 使用与本包匹配的新版 bridge-cli.exe。U盘新增包的Windows管理端在
+   unix/manager-windows/bridge-cli.exe，原目录旧Windows包继续保留。
+   可直接双击新版管理端：Windows/WinRM优先，无匹配WinRM时自动发现Unix SSH。
+   双击启动失败会显示原因并等回车关闭；多个目标时用下方 --target 指定。
+   首次建立 Unix 托管连接：
+   .\bridge-cli.exe ssh --target <Mac或Linux的IP> --manage
+   也可 --discover 自动发现；多个目标时补 --target 或 --instance。
+   目标用户确认配对后，管理端固定主机公钥，并核对 hostname、用户名和非 root UID。
+   不调用 WinRM trust，不要求提供目标账号密码，也不复用已有永久 SSH 私钥。
+2. 保持管理窗口打开，复制打印的 Codex 交接指令到聊天；已有 MCP 可复用四个工具。
+3. 先检查会话，再执行命令：
+   .\bridge-cli.exe session list
+   .\bridge-cli.exe session status --id <rb-会话编号>
+   .\bridge-cli.exe session exec --id <rb-会话编号> --command "hostname; id; uname -srm" --json
+   .\bridge-cli.exe session exec --id <rb-会话编号> --command "printf '中文测试\n'; exit 7" --json
+   Unix 命令使用 POSIX sh；不要发送 PowerShell 命令。每条命令独立 Shell，
+   变量和目录不在两条命令间保留；默认超时 30 秒，可设 --timeout 1 到 120 秒。
+   输出每流最多 512 KiB，过长会标记截断。非零远程退出码保留，CLI 返回 21。
+4. 结束管理端：
+   .\bridge-cli.exe session close --id <rb-会话编号>
+   或在管理窗口按回车 / Ctrl+C。这会关闭本地托管接口，不删除目标账号原有 SSH 权限。
+   目标临时入口需在目标窗口结束或等待原期限到期。
+5. 仅需一次命令时可省略 --manage：
+   .\bridge-cli.exe ssh --target <IP> --command "hostname; id"
+   --json 仅显示发现元数据，不配对、不执行 SSH。需要完整终端时省略 --command；
+   完整交互 Shell 当前只能记录会话事件，不能声称已逐条审计终端输入。
+6. 在 Unix 电脑作为管理机，可使用对应平台 bridge-cli，或从包根目录运行：
+   sh ./start-unix.sh --cli ssh --target <IP> --manage
+
+四、首轮实机验收清单
+1. 启动器无需首次Y；显式CLI确认取消/EOF不配置，自动启动模式拒绝非终端。
+   配对拒绝后无法登录；重新请求并允许后才能执行。
+2. 首条身份命令与本地账号一致，UID 非 0；第二条命令无需目标再次允许，期限不延长。
+3. 核验中文、多行、退出 7、输出截断和命令超时；Windows 能力需独立回归。
+4. 正常结束目标入口后 UDP/临时 SSH 不再可用，旧托管会话拒绝新命令。
+5. 使用较短期限单独测试到期，例如：sh ./start-unix.sh ssh --ttl 30s
+   记录开始/结束时刻；不能把短TTL或本地单元测试当作真实3小时连续运行验收。
+6. 单独验证异常退出、命令运行中结束、端口占用和重复启动。
+   核对本次 sshd/辅助进程、临时目录和授权已回收；失败时保留具体错误。
+7. 比对原有 authorized_keys、系统 SSH 配置/服务、远程登录和防火墙状态未被更改。
+   不要输出或复制真实私钥及密码；只做摘要和状态核验。
+
+五、日志、边界与文件回滚
+1. 目标入口审计保留在程序显示的 /var/log/RemoteBridge（Mac 对应 /private/var/log）。
+   启动器退出时将临时目录内的两份已知启动诊断保留到用户日志目录，并打印路径；
+   无法保存时保留原日志目录，不递归删除未知文件。
+   管理端审计为 %LOCALAPPDATA%\RemoteBridge\audit.jsonl，只记录命令摘要和元数据。
+2. 普通会话复用保留短期密钥，空闲的过期缓存下次调用时清理；没有后台清理服务。
+   SSH 托管每条命令重新建立 SSH transport，复用的是同一次批准的短期授权。
+3. SSH 的临时密钥/入口到期不会删除账号原有 SSH 或管理员权限。
+   已执行的文件/系统修改不会自动回滚，交给外部服务的工作也不保证撤回。
+4. SHA256SUMS 用于检测文件损坏，不提供发行者签名；本版为可信局域网自用测试包。
+5. 文件回滚：先结束两端程序，再将保留的旧平台包按原路径恢复；保留 logs。
+   文件回滚不能代替临时系统入口回收。Windows 包与它的备份无需删除。
+
+以上为使用和验收步骤。真实 Mac/Linux 已通过的项目，以开发交接实际记录为准。

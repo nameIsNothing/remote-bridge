@@ -32,6 +32,15 @@ var managedCommandScript string
 var managedUIScript string
 
 func runManage(args []string) int {
+	if hasArg(args, "--ssh") {
+		sshArgs := []string{"--manage", "--discover"}
+		for _, arg := range args {
+			if arg != "--ssh" {
+				sshArgs = append(sshArgs, arg)
+			}
+		}
+		return runSSH(sshArgs)
+	}
 	fs := flag.NewFlagSet("bridge-cli manage", flag.ContinueOnError)
 	target, broadcast := "", "255.255.255.255"
 	duration := discovery.DefaultDiscoverTimeout
@@ -57,9 +66,17 @@ func runManage(args []string) int {
 	if err != nil {
 		return fail(model.ExitConnection, err)
 	}
-	selected, err := selectWinRMAnnouncement(items, target)
+	selected, err := selectManagedAnnouncement(items, target)
 	if err != nil {
 		return fail(model.ExitConnection, err)
+	}
+	if selected.Transport == "ssh" {
+		address, err := chooseManagedAddress(selected, target)
+		if err != nil {
+			return fail(model.ExitConnection, err)
+		}
+		fmt.Printf("发现 Unix SSH 目标：%s (%s)，正在准备连接…\n", selected.Hostname, address)
+		return runSSH(managedSSHStartupArguments(selected, address, broadcast, duration, port))
 	}
 	if err := selected.Validate(); err != nil || selected.Expired(time.Now()) || !winrmlease.InstancePattern.MatchString(selected.InstanceID) {
 		return fail(model.ExitConnection, errors.New("目标实例信息无效或已过期"))

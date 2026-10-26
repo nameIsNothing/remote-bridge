@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -75,6 +76,7 @@ type PairResponse struct {
 	Hostname     string    `json:"hostname,omitempty"`
 	Port         int       `json:"port,omitempty"`
 	Username     string    `json:"username,omitempty"`
+	Shell        string    `json:"shell,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at,omitempty"`
 	HostKey      string    `json:"host_key,omitempty"`
 }
@@ -95,6 +97,7 @@ type Announcement struct {
 	Port         int       `json:"port"`
 	Transport    string    `json:"transport"`
 	Username     string    `json:"username"`
+	Shell        string    `json:"shell,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	RequestNonce string    `json:"request_nonce"`
 }
@@ -136,6 +139,9 @@ func (r PairResponse) Validate() error {
 	if !validText(r.InstanceID, 128) {
 		return fmt.Errorf("%w: missing pair response identity", ErrInvalidMessage)
 	}
+	if r.Shell != "" && r.Shell != "posix" {
+		return fmt.Errorf("%w: unsupported SSH shell", ErrInvalidMessage)
+	}
 	if r.Accepted {
 		if !validText(r.Hostname, 255) || r.Port < 1 || r.Port > 65535 || !validText(r.Username, 256) || r.ExpiresAt.IsZero() || !validPublicKeyText(r.HostKey) {
 			return fmt.Errorf("%w: accepted pair response is incomplete", ErrInvalidMessage)
@@ -152,6 +158,9 @@ func (a Announcement) Validate() error {
 	}
 	if !validText(a.InstanceID, 128) || !validText(a.Hostname, 255) || !validText(a.Username, 256) {
 		return fmt.Errorf("%w: missing announcement identity", ErrInvalidMessage)
+	}
+	if (a.Shell != "" && a.Shell != "posix") || (a.Shell != "" && a.Transport != "ssh") {
+		return fmt.Errorf("%w: unsupported SSH shell", ErrInvalidMessage)
 	}
 	if len(a.Addresses) == 0 || len(a.Addresses) > 32 {
 		return fmt.Errorf("%w: announcement addresses are invalid", ErrInvalidMessage)
@@ -297,6 +306,12 @@ func ServeResponder(ctx context.Context, conn *net.UDPConn, announcement Announc
 // requests on the same visible, short-lived UDP socket. Pairing is disabled
 // when handler is nil, preserving the original metadata-only responder.
 func ServeResponderWithPairing(ctx context.Context, conn *net.UDPConn, announcement Announcement, handler PairHandler) error {
+	return ServeResponderWithPairingFrom(ctx, conn, announcement, handler, nil)
+}
+
+// ServeResponderWithPairingFrom optionally restricts both metadata and pairing
+// to source addresses on the target's LAN. The nil policy keeps legacy behavior.
+func ServeResponderWithPairingFrom(ctx context.Context, conn *net.UDPConn, announcement Announcement, handler PairHandler, allowed func(net.IP) bool) error {
 	if conn == nil {
 		return errors.New("discovery responder: nil connection")
 	}
@@ -324,6 +339,9 @@ func ServeResponderWithPairing(ctx context.Context, conn *net.UDPConn, announcem
 				return nil
 			}
 			return err
+		}
+		if allowed != nil && !allowed(source.IP) {
+			continue
 		}
 		messageType, err := packetType(buf[:n])
 		if err != nil {
@@ -512,8 +530,7 @@ func validNonce(value string) bool {
 }
 
 func validText(value string, max int) bool {
-	value = strings.TrimSpace(value)
-	return value != "" && len(value) <= max && !strings.ContainsAny(value, "\r\n")
+	return strings.TrimSpace(value) != "" && len(value) <= max && strings.IndexFunc(value, unicode.IsControl) < 0
 }
 
 func validPublicKeyText(value string) bool {

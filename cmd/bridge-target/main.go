@@ -29,7 +29,7 @@ import (
 	"remote-bridge/internal/platform/windows"
 )
 
-const version = "0.2.9-test.1"
+const version = "0.3.1-test.1"
 
 // simpleLANManagementAddress is the Windows firewall alias for all active
 // local subnets.  The simple experiment mode deliberately uses this alias so
@@ -77,6 +77,9 @@ func main() {
 }
 
 func run(args []string) int {
+	if code, handled := runPlatformTarget(args); handled {
+		return code
+	}
 	if len(args) == 0 {
 		return runInteractive()
 	}
@@ -1138,9 +1141,11 @@ func fail(code model.ExitCode, err error) int {
 
 func printUsage() {
 	fmt.Fprintln(os.Stderr, `用法：
-  bridge-target                  （默认：“检查 / 连接”桌面窗口）
+  bridge-target                  （Windows：检查窗口；macOS/Linux：SSH终端向导）
   bridge-target gui              （打开桌面窗口，只读检查后确认配置）
   bridge-target ssh              （SSH 检测/安装/公钥配对向导）
+  bridge-target ssh --inspect    （macOS/Linux：只读检查JSON）
+  bridge-target ssh --ttl 3h     （macOS/Linux：确认后开启临时SSH入口）
   bridge-target winrm            （旧版 WinRM 局域网向导）
   bridge-target plan     --manager-ip <管理机IP> [选项]
   bridge-target inspect  --manager-ip <管理机IP> [选项]
@@ -1150,7 +1155,8 @@ func printUsage() {
   bridge-target rollback --state <bridge-plan.json>
 
 plan/inspect 默认只读。只有 apply 会创建临时账号/防火墙规则；revoke/rollback 只清理本计划拥有的资源。
-SSH 向导使用固定账号 RemoteBridge、一次性 Ed25519 公钥和临时 TCP 2222 入口；不会要求管理机输入密码。
+Windows SSH 向导使用固定账号 RemoteBridge；Unix SSH 使用当前非root账号和独立临时sshd。
+两条SSH路径均使用临时公钥和TCP 2222，不要求管理机输入目标密码。
 首次实验建议在“以管理员身份运行”的 PowerShell 中执行，并让管理机与目标机处于同一可信局域网。
 apply --json 默认隐藏密码；只有明确加 --show-secret 才会把一次性密码放进 JSON。
 apply 成功后默认在目标 exe 所在目录生成 REMOTE-BRIDGE.md 和 remote-bridge-connection.json；可用 --instructions-dir 指定输出目录。`)

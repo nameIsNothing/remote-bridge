@@ -35,19 +35,30 @@ func runSSH(args []string) int {
 	discover := false
 	jsonOutput := false
 	forgetSession := false
+	manage := false
 	fs.BoolVar(&discover, "discover", false, "通过 UDP 发现并配对目标")
 	fs.StringVar(&target, "target", "", "目标 IP/主机名；省略时使用发现结果")
 	fs.StringVar(&instance, "instance", "", "目标实例 ID（可选，用于多个目标时消歧）")
 	fs.StringVar(&username, "username", "", "目标 SSH 用户名（通常由配对响应返回）")
-	fs.StringVar(&command, "command", "", "目标 PowerShell 命令；省略进入交互会话")
+	fs.StringVar(&command, "command", "", "目标 Shell 命令；省略进入交互会话")
 	fs.StringVar(&broadcast, "broadcast", broadcast, "IPv4 广播或定向广播地址")
 	fs.DurationVar(&timeout, "timeout", timeout, "UDP 发现等待时间，例如 2s")
 	fs.DurationVar(&pairTimeout, "pair-timeout", pairTimeout, "目标机点击配对确认的等待时间，例如 120s")
 	fs.IntVar(&port, "discovery-port", port, "UDP 发现端口")
 	fs.BoolVar(&jsonOutput, "json", false, "仅输出发现元数据 JSON，不配对、不启动 SSH")
 	fs.BoolVar(&forgetSession, "forget-session", false, "清除选定实例的本地 SSH 授权缓存并结束；可与 --instance 离线使用")
+	fs.BoolVar(&manage, "manage", false, "建立 SSH 托管会话，供 CLI / MCP 复用")
 	if err := fs.Parse(args); err != nil {
 		return int(model.ExitUsage)
+	}
+	commandSet := false
+	fs.Visit(func(option *flag.Flag) {
+		if option.Name == "command" {
+			commandSet = true
+		}
+	})
+	if fs.NArg() != 0 {
+		return fail(model.ExitUsage, errors.New("存在未识别的位置参数"))
 	}
 	if timeout <= 0 || timeout > 30*time.Second {
 		return fail(model.ExitUsage, errors.New("timeout 必须在 1ns 到 30s 之间"))
@@ -60,6 +71,9 @@ func runSSH(args []string) int {
 	}
 	if forgetSession && (jsonOutput || strings.TrimSpace(command) != "") {
 		return fail(model.ExitUsage, errors.New("forget-session 不可与 --json 或 --command 一起使用"))
+	}
+	if manage && (commandSet || jsonOutput || forgetSession) {
+		return fail(model.ExitUsage, errors.New("manage 不可与 --command、--json 或 --forget-session 一起使用"))
 	}
 	if !discover && strings.TrimSpace(target) == "" && !(forgetSession && strings.TrimSpace(instance) != "") {
 		return fail(model.ExitUsage, errors.New("ssh 需要 --discover 或 --target"))
@@ -131,23 +145,29 @@ func runSSH(args []string) int {
 		eventType = "manager.ssh.reuse"
 	}
 	appendSSHAudit(eventType, endpoint.IP.String(), username, "", record.Port, 0, nil, selected.InstanceID)
+	if manage {
+		return runManagedSSH(selected, endpoint, record, session)
+	}
 	sessionCtx, sessionCancel := context.WithDeadline(context.Background(), record.ExpiresAt)
 	defer sessionCancel()
 	if strings.TrimSpace(command) == "" {
-		fmt.Printf("授权已就绪：%s@%s:%d，有效至 %s，正在打开 PowerShell。\n", username, endpoint.IP, record.Port, record.ExpiresAt.Local().Format("15:04:05"))
-		result, runErr := sshclient.RunInteractive(sessionCtx, endpoint.IP.String(), record.Port, username, session.privatePath(), session.knownHostsPath())
+		fmt.Printf("授权已就绪：%s@%s:%d，有效至 %s，正在打开远程 Shell。\n", username, endpoint.IP, record.Port, record.ExpiresAt.Local().Format("15:04:05"))
+		result, runErr := sshclient.RunShellInteractive(sessionCtx, endpoint.IP.String(), record.Port, username, session.privatePath(), session.knownHostsPath(), record.Shell)
 		appendSSHAudit("manager.ssh.shell", endpoint.IP.String(), username, "", record.Port, result.ExitCode, runErr, selected.InstanceID)
 		if runErr != nil {
 			return int(model.ExitConnection)
 		}
 		return int(model.ExitOK)
 	}
-	result, runErr := sshclient.Run(sessionCtx, endpoint.IP.String(), record.Port, username, session.privatePath(), session.knownHostsPath(), command)
+	result, runErr := sshclient.RunShell(sessionCtx, endpoint.IP.String(), record.Port, username, session.privatePath(), session.knownHostsPath(), record.Shell, command)
 	if strings.TrimSpace(result.Stdout) != "" {
 		fmt.Print(result.Stdout)
 	}
 	if strings.TrimSpace(result.Stderr) != "" {
 		fmt.Fprint(os.Stderr, result.Stderr)
+	}
+	if result.Truncated {
+		fmt.Fprintln(os.Stderr, "\n输出过长，已截断。请缩小查询范围。")
 	}
 	appendSSHAudit("manager.ssh.exec", endpoint.IP.String(), username, command, record.Port, result.ExitCode, runErr, selected.InstanceID)
 	if runErr != nil || result.ExitCode != 0 {

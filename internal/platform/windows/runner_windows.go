@@ -33,6 +33,9 @@ func (SystemRunner) Run(ctx context.Context, command Command) (Result, error) {
 		return result, ErrInvalidOptions
 	}
 	process := exec.CommandContext(ctx, command.Program, command.Args...)
+	// An explicit EOF pipe avoids os/exec opening NUL for nil stdin. Some
+	// target systems cannot open that device before PowerShell even starts.
+	process.Stdin = strings.NewReader("")
 	// Captured helpers must not spawn console windows over the desktop UI.
 	process.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	var stdout, stderr bytes.Buffer

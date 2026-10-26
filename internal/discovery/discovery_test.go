@@ -18,6 +18,17 @@ func testAnnouncement(nonce string) Announcement {
 	}
 }
 
+func TestPairingIdentityRejectsTerminalControlCharacters(t *testing.T) {
+	for _, value := range []string{"\x1b[2Jmanager", "manager\a", "manager\x00", "manager\x7f", "\nmanager", "manager\r", "manager\t"} {
+		if validText(value, 255) {
+			t.Fatalf("terminal control accepted: %q", value)
+		}
+	}
+	if !validText("管理电脑-01", 255) {
+		t.Fatal("printable Unicode identity rejected")
+	}
+}
+
 func TestQueryAndAnnouncementRoundTrip(t *testing.T) {
 	q, err := NewQuery()
 	if err != nil {
@@ -153,6 +164,41 @@ func TestAnnouncementJSONHasNoCredentialFields(t *testing.T) {
 		if strings.Contains(string(b), field) {
 			t.Fatalf("forbidden field %q in %s", field, b)
 		}
+	}
+}
+
+func TestSSHShellWireCompatibilityAndValidation(t *testing.T) {
+	announcement := testAnnouncement("")
+	announcement.Transport = "ssh"
+	response := PairResponse{V: Version, Type: PairResponseType, InstanceID: announcement.InstanceID, RequestNonce: strings.Repeat("a", 32), Accepted: true, Hostname: announcement.Hostname, Port: 2222, Username: announcement.Username, ExpiresAt: announcement.ExpiresAt, HostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZm"}
+	for _, shell := range []string{"", "posix"} {
+		announcement.Shell, response.Shell = shell, shell
+		data, err := MarshalAnnouncement(announcement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotAnnouncement, err := UnmarshalAnnouncement(data)
+		if err != nil || gotAnnouncement.Shell != shell || strings.Contains(string(data), `"shell"`) != (shell != "") {
+			t.Fatalf("announcement shell=%q data=%s err=%v", shell, data, err)
+		}
+		data, err = MarshalPairResponse(response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotResponse, err := UnmarshalPairResponse(data)
+		if err != nil || gotResponse.Shell != shell || strings.Contains(string(data), `"shell"`) != (shell != "") {
+			t.Fatalf("response shell=%q data=%s err=%v", shell, data, err)
+		}
+	}
+	for _, shell := range []string{"bash", "powershell", "posix\n", "sh -s"} {
+		announcement.Shell, response.Shell = shell, shell
+		if announcement.Validate() == nil || response.Validate() == nil {
+			t.Fatalf("invalid shell %q accepted", shell)
+		}
+	}
+	announcement.Shell, announcement.Transport = "posix", "winrm-http"
+	if announcement.Validate() == nil {
+		t.Fatal("WinRM announcement accepted a POSIX shell")
 	}
 }
 

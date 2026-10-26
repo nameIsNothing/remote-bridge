@@ -1,5 +1,5 @@
 // Package managedsession exposes one visible, short-lived manager-owned
-// WinRM session to local CLI and MCP clients. No Windows password enters Go.
+// remote session to local CLI and MCP clients. No Windows password enters Go.
 package managedsession
 
 import (
@@ -7,12 +7,14 @@ import (
 	"regexp"
 	"time"
 
+	"remote-bridge/internal/unixssh"
 	"remote-bridge/internal/winrmlease"
 )
 
 const MaxOutput = 512 * 1024
 const MaxCommand = 64 * 1024
 const MaxLifetime = winrmlease.MaxLifetime
+const MaxSSHLifetime = unixssh.MaxLifetime
 
 var IDPattern = regexp.MustCompile(`^rb-[a-f0-9]{24}$`)
 var ErrClosed = errors.New("托管会话已结束或失去连接，请在管理端重新连接")
@@ -25,6 +27,9 @@ type Info struct {
 	Hostname   string    `json:"hostname"`
 	Username   string    `json:"username"`
 	SID        string    `json:"sid,omitempty"`
+	Transport  string    `json:"transport,omitempty"`
+	Shell      string    `json:"shell,omitempty"`
+	UID        string    `json:"uid,omitempty"`
 	Port       int       `json:"port"`
 	State      string    `json:"state"`
 	Reason     string    `json:"reason,omitempty"`

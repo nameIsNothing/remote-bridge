@@ -34,7 +34,7 @@ func initializeTargetDiagnostics(args []string) {
 		mode = strings.ToLower(args[0])
 	}
 	switch mode {
-	case "version", "--version", "-v", "help", "--help", "-h", "ssh-service":
+	case "version", "--version", "-v", "help", "--help", "-h", "ssh-service", "ssh-unix-host", "ssh-unix-session", "ssh-unix-run":
 		// The service initializes only after its SCM/SYSTEM ownership checks.
 		return
 	case "gui", "ssh", "winrm", "inspect", "check", "plan", "apply", "--apply", "revoke", "rollback":

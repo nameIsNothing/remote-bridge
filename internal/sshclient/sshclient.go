@@ -1,10 +1,12 @@
 package sshclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"remote-bridge/internal/cliutil"
 )
@@ -32,11 +35,15 @@ type KeyPair struct {
 
 // Result captures an OpenSSH process without persisting command output.
 type Result struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
-	Duration time.Duration
+	Stdout    string
+	Stderr    string
+	ExitCode  int
+	Duration  time.Duration
+	Truncated bool
 }
+
+// MaxOutput bounds each captured stream while continuing to drain the child.
+const MaxOutput = 512 * 1024
 
 // GenerateKeyPair creates an Ed25519 key using the platform OpenSSH tooling.
 // It refuses to overwrite an existing path and never supplies a passphrase or
@@ -73,8 +80,9 @@ func GenerateKeyPair(ctx context.Context, directory, name string) (KeyPair, erro
 	comment := "remote-bridge-" + name
 	cmd := exec.CommandContext(ctx, keygen, "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", privatePath)
 	hideCapturedProcess(cmd)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdin = strings.NewReader("")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(privatePath)
 		_ = os.Remove(publicPath)
@@ -176,36 +184,81 @@ func WriteKnownHosts(path, line string) error {
 // is encoded as UTF-16LE PowerShell -EncodedCommand text to avoid shell
 // quoting and command-injection ambiguity.
 func Run(ctx context.Context, target string, port int, username, privateKey, knownHosts, command string) (Result, error) {
+	return RunShell(ctx, target, port, username, privateKey, knownHosts, "", command)
+}
+
+// RunShell executes a command using the target's paired shell. Empty shell
+// preserves the Windows protocol; posix sends UTF-8 script text to sh -s.
+func RunShell(ctx context.Context, target string, port int, username, privateKey, knownHosts, shell, command string) (Result, error) {
 	if err := validateConnection(target, port, username, privateKey, knownHosts); err != nil {
 		return Result{ExitCode: -1}, err
 	}
-	if strings.TrimSpace(command) == "" {
+	if strings.TrimSpace(command) == "" || strings.ContainsRune(command, 0) {
 		return Result{ExitCode: -1}, errors.New("remote command is required")
 	}
-	encoded, err := cliutil.EncodePowerShell("$ErrorActionPreference = 'Stop'; " + command)
+	remote, input, err := shellCommand(shell, command, false)
 	if err != nil {
 		return Result{ExitCode: -1}, err
 	}
+	if shell == "posix" {
+		seconds := 120
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := int((time.Until(deadline) + time.Second - 1) / time.Second)
+			if remaining < 1 {
+				remaining = 1
+			}
+			if remaining < seconds {
+				seconds = remaining
+			}
+		}
+		input = strings.NewReader(fmt.Sprintf("# remote-bridge-timeout: %d\n", seconds) + command)
+	}
+	return run(ctx, target, port, username, privateKey, knownHosts, remote, input, false, false)
+}
+
+func shellCommand(shell, command string, interactive bool) ([]string, io.Reader, error) {
+	if shell == "posix" {
+		if interactive {
+			return nil, nil, nil
+		}
+		return []string{"sh", "-s"}, strings.NewReader(command + "\n"), nil
+	}
+	if shell != "" {
+		return nil, nil, errors.New("unsupported SSH shell")
+	}
+	if interactive {
+		return []string{"powershell.exe", "-NoLogo", "-NoProfile"}, nil, nil
+	}
+	encoded, err := cliutil.EncodePowerShell("$ErrorActionPreference = 'Stop'; " + command)
+	if err != nil {
+		return nil, nil, err
+	}
 	remote := []string{"powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded}
-	return run(ctx, target, port, username, privateKey, knownHosts, remote, false)
+	return remote, strings.NewReader(""), nil
 }
 
 // RunInteractive opens a PowerShell session over SSH. It intentionally uses
 // the caller's stdio instead of capturing terminal contents in audit logs.
 func RunInteractive(ctx context.Context, target string, port int, username, privateKey, knownHosts string) (Result, error) {
+	return RunShellInteractive(ctx, target, port, username, privateKey, knownHosts, "")
+}
+
+func RunShellInteractive(ctx context.Context, target string, port int, username, privateKey, knownHosts, shell string) (Result, error) {
 	if err := validateConnection(target, port, username, privateKey, knownHosts); err != nil {
 		return Result{ExitCode: -1}, err
 	}
-	remote := []string{"powershell.exe", "-NoLogo", "-NoProfile"}
-	return run(ctx, target, port, username, privateKey, knownHosts, remote, true)
+	remote, input, err := shellCommand(shell, "", true)
+	if err != nil {
+		return Result{ExitCode: -1}, err
+	}
+	return run(ctx, target, port, username, privateKey, knownHosts, remote, input, true, shell == "posix")
 }
 
-func run(ctx context.Context, target string, port int, username, privateKey, knownHosts string, remote []string, interactive bool) (Result, error) {
+func run(ctx context.Context, target string, port int, username, privateKey, knownHosts string, remote []string, input io.Reader, interactive, requestPTY bool) (Result, error) {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
 		return Result{ExitCode: -1}, errors.New("ssh client not found on the management machine")
 	}
-	started := time.Now()
 	args := []string{
 		"-F", "none",
 		"-o", "BatchMode=yes",
@@ -220,10 +273,19 @@ func run(ctx context.Context, target string, port int, username, privateKey, kno
 		"-o", "UserKnownHostsFile=" + knownHosts,
 		"-i", privateKey,
 		"-p", strconv.Itoa(port),
-		username + "@" + target,
 	}
+	if requestPTY {
+		args = append(args, "-tt")
+	}
+	args = append(args, username+"@"+target)
 	args = append(args, remote...)
 	cmd := exec.CommandContext(ctx, sshPath, args...)
+	cmd.Stdin = input
+	return runProcess(cmd, interactive)
+}
+
+func runProcess(cmd *exec.Cmd, interactive bool) (Result, error) {
+	started := time.Now()
 	result := Result{ExitCode: -1}
 	if interactive {
 		cmd.Stdin = os.Stdin
@@ -236,18 +298,53 @@ func run(ctx context.Context, target string, port int, username, privateKey, kno
 		}
 		return result, err
 	}
-	var stdout, stderr strings.Builder
+	var stdout, stderr boundedOutput
 	hideCapturedProcess(cmd)
+	// Bound pipe draining if a canceled SSH helper leaves inherited handles.
+	cmd.WaitDelay = 2 * time.Second
+	if cmd.Stdin == nil {
+		cmd.Stdin = strings.NewReader("")
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	err := cmd.Run()
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
+	result.Truncated = stdout.truncated || stderr.truncated
 	result.Duration = time.Since(started)
 	if cmd.ProcessState != nil {
 		result.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	return result, err
+}
+
+type boundedOutput struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedOutput) String() string {
+	value := strings.ToValidUTF8(b.buffer.String(), "\uFFFD")
+	if len(value) > MaxOutput {
+		b.truncated = true
+		end := MaxOutput
+		for end > 0 && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		value = value[:end]
+	}
+	return value
+}
+
+func (b *boundedOutput) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := MaxOutput - b.buffer.Len()
+	if len(data) > remaining {
+		data = data[:remaining]
+		b.truncated = true
+	}
+	_, _ = b.buffer.Write(data)
+	return written, nil
 }
 
 func validateConnection(target string, port int, username, privateKey, knownHosts string) error {

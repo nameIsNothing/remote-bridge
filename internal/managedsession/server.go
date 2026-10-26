@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +51,7 @@ func RandomID(prefix string, bytes int) (string, error) {
 func NewServer(info Info, audit AuditFunc) (*Server, error) {
 	now := time.Now()
 	if !IDPattern.MatchString(info.ID) || info.InstanceID == "" || info.Target == "" || info.Hostname == "" || info.Username == "" ||
-		(info.Port != 5985 && info.Port != 5986) || !info.ExpiresAt.After(now) || info.ExpiresAt.After(now.Add(MaxLifetime)) {
+		!info.ExpiresAt.After(now) || !validTransport(info, now) {
 		return nil, errors.New("托管会话绑定或有效期无效")
 	}
 	token, err := RandomID("", 32)
@@ -90,6 +91,86 @@ func NewServer(info Info, audit AuditFunc) (*Server, error) {
 		}
 	}()
 	return s, nil
+}
+
+func validTransport(info Info, now time.Time) bool {
+	switch info.Transport {
+	case "", "winrm":
+		return (info.Port == 5985 || info.Port == 5986) && info.Shell == "" && info.UID == "" && !info.ExpiresAt.After(now.Add(MaxLifetime))
+	case "ssh":
+		return info.Port > 0 && info.Port <= 65535 && info.Shell == "posix" && ValidUnixUID(info.UID) && info.SID == "" && !info.ExpiresAt.After(now.Add(MaxSSHLifetime))
+	default:
+		return false
+	}
+}
+
+// ValidUnixUID accepts a canonical, non-root Unix account identity.
+func ValidUnixUID(value string) bool {
+	uid, err := strconv.ParseUint(value, 10, 32)
+	return err == nil && uid > 0 && strconv.FormatUint(uid, 10) == value
+}
+
+// Ready binds an authenticated worker to the endpoint and account selected
+// before the local API was opened. The in-process SSH worker and the external
+// WinRM worker share this transition and all subsequent command checks.
+func (s *Server) Ready(info Info) error {
+	s.mu.Lock()
+	valid := s.info.State == "connecting" && info.InstanceID == s.info.InstanceID &&
+		time.Now().Before(info.ExpiresAt) && !info.ExpiresAt.After(s.info.ExpiresAt)
+	if s.info.Transport == "ssh" {
+		valid = valid && info.ID == s.info.ID && info.Target == s.info.Target && info.Port == s.info.Port &&
+			info.Transport == "ssh" && info.Shell == "posix" && info.Hostname == s.info.Hostname && info.Username == s.info.Username &&
+			ValidUnixUID(info.UID) && info.UID == s.info.UID && info.SID == ""
+	} else {
+		valid = valid && strings.EqualFold(info.Hostname, s.info.Hostname) && strings.EqualFold(info.Username, s.info.Username) &&
+			strings.HasPrefix(info.SID, "S-1-") && info.UID == "" && info.Shell == "" && info.Transport == s.info.Transport &&
+			(info.ID == "" || info.ID == s.info.ID) && (info.Target == "" || info.Target == s.info.Target) && (info.Port == 0 || info.Port == s.info.Port)
+	}
+	if valid {
+		s.info.SID, s.info.UID = info.SID, info.UID
+		s.info.ExpiresAt, s.info.State = info.ExpiresAt, "connected"
+	}
+	s.mu.Unlock()
+	if !valid {
+		s.BeginClose("认证身份、实例或期限不匹配")
+		return errors.New("binding mismatch")
+	}
+	s.readyOnce.Do(func() { close(s.ready) })
+	return nil
+}
+
+// NextWork is used by the manager-owned SSH worker. Only local code can call
+// it; external workers must authenticate through the loopback HTTPS endpoint.
+func (s *Server) NextWork(ctx context.Context) Work {
+	select {
+	case <-s.closing:
+		return Work{Operation: "close"}
+	default:
+	}
+	select {
+	case <-s.closing:
+		return Work{Operation: "close"}
+	case work := <-s.work:
+		return work
+	case <-ctx.Done():
+		return Work{Operation: "idle"}
+	}
+}
+
+func (s *Server) CompleteWork(id string, result *Result, err error) {
+	message := WorkerMessage{ID: id, Result: result}
+	if err != nil {
+		message.Error = err.Error()
+	}
+	s.mu.Lock()
+	ch := s.pending[id]
+	s.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- message:
+		default:
+		}
+	}
 }
 
 func localCertificate(expiry time.Time) (tls.Certificate, string, error) {
@@ -315,23 +396,11 @@ func (s *Server) worker(w http.ResponseWriter, r *http.Request) {
 	}
 	switch message.Operation {
 	case "ready":
-		info := message.Info
-		s.mu.Lock()
-		valid := info != nil && s.info.State == "connecting" && strings.EqualFold(info.Hostname, s.info.Hostname) &&
-			strings.EqualFold(info.Username, s.info.Username) && strings.HasPrefix(info.SID, "S-1-") && info.InstanceID == s.info.InstanceID &&
-			time.Now().Before(info.ExpiresAt) && !info.ExpiresAt.After(s.info.ExpiresAt)
-		if valid {
-			s.info.SID = info.SID
-			s.info.ExpiresAt = info.ExpiresAt
-			s.info.State = "connected"
-		}
-		s.mu.Unlock()
-		if !valid {
+		if message.Info == nil || s.Ready(*message.Info) != nil {
 			s.BeginClose("认证身份、实例或期限不匹配")
 			http.Error(w, "binding mismatch", 409)
 			return
 		}
-		s.readyOnce.Do(func() { close(s.ready) })
 		_ = json.NewEncoder(w).Encode(Work{Operation: "idle"})
 	case "next":
 		select {

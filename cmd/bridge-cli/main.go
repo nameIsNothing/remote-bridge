@@ -21,10 +21,15 @@ import (
 	"remote-bridge/internal/model"
 )
 
-const version = "0.2.9-test.1"
+const version = "0.3.1-test.1"
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	args := os.Args[1:]
+	code := run(args)
+	if len(args) == 0 && code != 0 {
+		pauseManagerOnStartupError()
+	}
+	os.Exit(code)
 }
 
 func run(args []string) int {
@@ -476,17 +481,19 @@ func fail(code model.ExitCode, err error) int {
 func printUsage() {
 	fmt.Fprintln(os.Stderr, `用法：
   bridge-cli manage --discover [--target <IP>]
+  bridge-cli manage --ssh [--target <IP>]
   bridge-cli session list
   bridge-cli session status --id <rb-会话编号>
-  bridge-cli session exec --id <rb-会话编号> --command <PowerShell命令>
+  bridge-cli session exec --id <rb-会话编号> --command <远程Shell命令>
   bridge-cli session close --id <rb-会话编号>
   bridge-cli mcp
   bridge-cli check --target <主机名或IP> [--port 5985]
   bridge-cli trust <主机名或IP>
   bridge-cli trust --target <主机名或IP>
   bridge-cli discover --once [--json] [--timeout 2s]
-  bridge-cli ssh --discover [--pair-timeout 60s] [--command <PowerShell命令>]
-  bridge-cli ssh --target <主机名或IP> [--instance <实例ID>] [--command <PowerShell命令>]
+  bridge-cli ssh --discover [--pair-timeout 60s] [--command <远程Shell命令>]
+  bridge-cli ssh --target <主机名或IP> [--instance <实例ID>] [--command <远程Shell命令>]
+  bridge-cli ssh --target <Unix目标IP> --manage
   bridge-cli connect --discover [--command <PowerShell命令>]
   bridge-cli exec  --target <主机名或IP> --username <临时账号> --command <PowerShell命令>
   bridge-cli shell --target <主机名或IP> --username <临时账号>

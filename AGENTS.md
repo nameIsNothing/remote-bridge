@@ -13,6 +13,9 @@ Remote Bridge 用于让管理端 Codex 通过命令行排查远程 Windows、mac
 - 第三阶段增加 Ubuntu/macOS 的 SSH 连接。
 - 远程桌面不属于第一阶段；先完成可审计的远程命令行。
 
+- 用户于 2026-10-26 明确将 Linux/macOS U 盘 SSH 快速连接列为下一任务，现有 Mac 可先验收；明确要求 clear 后再开始。优先级以开发交接顶部为准，无需先做公网 Relay；保留 Windows 能力和既有未完成项。
+- 用户于 2026-10-26 测试通过后要求 Unix SSH 入口/会话改为3小时，并省略U盘启动时第一次Y。打开交互式启动器即可开始，正常sudo和首次管理端配对允许继续保留；普通显式CLI仍需确认，旧Windows SSH仍30分钟。旧运行入口不自动延长。
+
 ## 开始工作前
 
 - 完整阅读 `docs/开发交接.md` 和 `docs/agent-start.md`，再根据任务阅读 README、开发计划、方案与安全边界。

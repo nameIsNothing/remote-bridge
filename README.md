@@ -1,12 +1,33 @@
-# Remote Bridge 0.2.9-test.1（Windows 局域网）
+# Remote Bridge 0.3.1-test.1（Windows / Linux / macOS 局域网）
 
 开发续接先读 [项目规则](AGENTS.md)、[开发交接](docs/开发交接.md) 和 [Agent 启动说明](docs/agent-start.md)。工程已经存在；GitLab 部署与运维位于同级 `../gitlab-ops`。
+
+0.3.1-test.1 将 Linux/macOS SSH 目标入口、批准缓存和托管会话统一设为 **3 小时**，从目标本次开启入口时计算，复用不续期。打开交互式 U盘启动器后直接开始，省略启动时第一次 `y`；正常 sudo 授权与管理端首次配对允许保留。直接调用 `bridge-target ssh` 仍需完整确认，后台/管道不能使用启动器的 `--start` 模式。旧窗口保持原期限，需更新两端并重新开启才生效。旧 Windows SSH 仍为30分钟，WinRM仍为3小时，单条命令超时不变。
+
+管理端 0.3.0-test.3 修复双击找不到 WinRM 目标后立即关闭窗口的问题：保持 Windows/WinRM 优先，没有匹配 WinRM 时自动识别 Unix SSH。双击启动失败会保留独占控制台并等待回车；命令行参数、后台调用和 MCP 不新增暂停。目标端继续为 0.3.0-test.2，协议与权限模型不变。
+
+0.3.0-test.2 修复 Unix 授权文件上方 `/var/tmp` 可写、与 OpenSSH StrictModes 不兼容的问题。临时入口改用 macOS `/private/var` 或 Linux `/var/lib` 下的独立目录，逐级验证 root 所有权、写权限和普通账号遍历权限；不调整既有系统目录权限。管理端身份检查失败会显示具体 SSH 错误。
+
+Unix 测试版新增 U 盘启动器：Mac 打开 `unix/Start.command`，Linux 在终端运行 `sh unix/start-unix.sh`。启动器选择对应架构，将校验后的程序复制到本机运行；目标机无需安装开发环境。显示检查说明后直接请求正常 sudo 授权，开启最长 3 小时的独立 SSH 入口，首次配对再由目标用户确认。原账号、系统 SSH、已有密钥及防火墙不被改写；远程命令使用普通账号权限。
+
+管理机使用匹配的新版程序：`bridge-cli.exe ssh --target <IP> --manage`。连接后复用现有 `session status / exec / close` 和四个 MCP 工具，Unix 命令使用 POSIX `sh`。每条命令重新建立 SSH 连接，复用同一次批准的短期授权与固定主机公钥；期限不延长。单条命令最多 120 秒，输出每流最多 512 KiB。完整启动、权限、日志、回滚及验收步骤见 [Unix 测试说明](docs/TESTING-UNIX.txt)。Mac 及 Linux 的实机完成项分别以开发交接为准。
+
+```powershell
+.\scripts\build-unix.ps1 -Archive
+# 输出 dist/unix，覆盖 macOS/Linux 的 amd64、arm64；Windows 包单独构建。
+.\bridge-cli.exe ssh --target <IP> --manage
+.\bridge-cli.exe session exec --id rb-<会话编号> --command "hostname; id; uname -srm" --json
+```
+
+0.2.9-test.3 为非交互系统检查和 WinRM 配置助手显式提供空输入管道，避免在启动 PowerShell 前因无法打开 Windows 的 NUL 设备而失败。无需修改 NUL 驱动、UAC 或安全软件设置；新电脑仍需用新版实测。交互式输入及会话权限不变。
+
+0.2.9-test.2 修复 WinRM 重复回收遇到“规则或临时账号已不存在”的终止错误时误报失败的问题。权限、提供程序和资源归属错误继续明确失败；不会删除当前 Windows 账号。错误密码与重复清理的现场因果仍需日志核验，3 小时会话策略不变。
 
 **当前开发版（2026-10-20）：** 默认使用 WinRM 当前账号托管连接，保留 SSH。管理端输入一次密码后保持认证会话，通过 CLI / MCP 交给 Codex；可复制交接指令，在任一端结束。目标端绑定入口期限并反馈认证状态。详见 [托管会话设计](docs/托管会话设计.md) 和 [中文测试说明](docs/TESTING-WINRM.txt)。新流程需要两端一起更新，真实双机验收仍待完成；旧 0.2.7-test.1 的登录实测不能代替本版验收。
 
 目标电脑双击 `bridge-target.exe`，确认配置并保持窗口打开。管理电脑双击 `bridge-cli.exe`，在原生窗口输入公告账号的 Windows 密码，登录后点击“复制 Codex 交接指令”并发到聊天。管理窗口保持打开即可复用连接，不需要把密码交给 Codex。
 
-0.2.9-test.1 将 WinRM 托管入口和管理会话设为 **3 小时**，从目标端本次配置时起计时；复用、断开后重连均不续期。两端需更新并重新打开，已有会话的原期限不变。SSH 路径仍为 30 分钟。管理端倒计时显示时、分、秒。
+0.2.9-test.1 将 WinRM 托管入口和管理会话设为 **3 小时**，从目标端本次配置时起计时；复用、断开后重连均不续期。两端需更新并重新打开，已有会话的原期限不变。旧 Windows SSH 路径仍为 30 分钟。管理端倒计时显示时、分、秒。
 
 会话权限取决于目标 Windows 登录令牌，不会因目标配置窗口经过 UAC 提升而自动变成管理员。EDY 的既有实测令牌为普通远程权限；本版只延长时间，不增加权限。
 
@@ -14,7 +35,7 @@
 
 0.2.8-test.3 仅修复管理端派发命令时的超时参数转换。发布包内管理端为 test.3，目标端继续为 test.2；已运行 test.2 目标窗口时无需再次覆盖目标端。
 
-这是可信局域网内的自用实验工具，目标机不运行业务 Agent。公网 Relay、远程桌面、Web、macOS/Linux 尚未实现。保留 LocalSubnet 和离线包 SHA-256 校验，不要求签名。UAC 前原用户交接、普通账号首次授权以及两端异常退出后的完整回收仍需完善；已有账号的原生 WinRM 权限不随托管连接结束而删除。
+这是可信局域网内的自用实验工具，目标机不运行业务 Agent。公网 Relay、远程桌面、Web 尚未实现。Windows 保留 LocalSubnet 和离线包 SHA-256 校验，不要求发行者签名。UAC 前原用户交接、普通账号首次授权以及两端异常退出后的完整回收仍需完善；已有账号的原生 WinRM/SSH 权限不随托管连接结束而删除。
 
 ## 当前托管连接
 

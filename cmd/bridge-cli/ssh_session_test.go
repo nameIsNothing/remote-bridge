@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -72,7 +73,7 @@ func (f *sshSessionFixture) pair(_ context.Context, request discovery.PairReques
 		f.approvedKeys[request.PublicKey] = true
 		f.approvals++
 	}
-	return discovery.PairResponse{V: discovery.Version, Type: discovery.PairResponseType, InstanceID: request.InstanceID, RequestNonce: request.RequestNonce, Accepted: true, Hostname: "fixture-target", Port: 2222, Username: "RemoteBridge", ExpiresAt: f.responseUntil, HostKey: f.hostKey}, nil
+	return discovery.PairResponse{V: discovery.Version, Type: discovery.PairResponseType, InstanceID: request.InstanceID, RequestNonce: request.RequestNonce, Accepted: true, Hostname: "fixture-target", Port: f.announcement.Port, Username: f.announcement.Username, Shell: f.announcement.Shell, ExpiresAt: f.responseUntil, HostKey: f.hostKey}, nil
 }
 
 func (f *sshSessionFixture) open(t *testing.T) *lockedSSHSession {
@@ -134,6 +135,7 @@ func TestSSHSessionRejectsChangedBindingWithoutPairing(t *testing.T) {
 		{"discovery port", func(_ *discovery.Announcement, e *net.UDPAddr, _ *string) { e.Port++ }},
 		{"announced username", func(a *discovery.Announcement, _ *net.UDPAddr, _ *string) { a.Username = "Administrator" }},
 		{"username override", func(_ *discovery.Announcement, _ *net.UDPAddr, user *string) { *user = "Administrator" }},
+		{"shell", func(a *discovery.Announcement, _ *net.UDPAddr, _ *string) { a.Shell = "posix" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -208,6 +210,143 @@ func TestSSHSessionExpiryIsCappedAndNeverRenewed(t *testing.T) {
 				t.Fatalf("expired record err=%v", err)
 			}
 		})
+	}
+}
+
+func TestSSHSessionLifetimeUsesBoundShellAndNeverRenews(t *testing.T) {
+	for _, test := range []struct {
+		name, shell                  string
+		announcement, response, want time.Duration
+	}{
+		{"Unix exact three hours", "posix", 3 * time.Hour, 3 * time.Hour, 3 * time.Hour},
+		{"Unix upper cap", "posix", 4 * time.Hour, 4 * time.Hour, 3 * time.Hour},
+		{"Unix short announcement", "posix", 30 * time.Minute, 3 * time.Hour, 30 * time.Minute},
+		{"Unix short response", "posix", 3 * time.Hour, 30 * time.Minute, 30 * time.Minute},
+		{"Windows remains thirty minutes", "", 3 * time.Hour, 3 * time.Hour, 30 * time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newSSHSessionFixture(t)
+			start := f.now
+			f.announcement.Shell = test.shell
+			f.announcement.ExpiresAt = start.Add(test.announcement)
+			f.responseUntil = start.Add(test.response)
+			session := f.open(t)
+			first := f.authorize(t, session)
+			if !first.ExpiresAt.Equal(start.Add(test.want)) {
+				t.Fatalf("expiry=%s want=%s", first.ExpiresAt, start.Add(test.want))
+			}
+			// A two-hour point proves Unix records survive the old 30-minute
+			// validator, while shorter/legacy approvals stay readable before expiry.
+			advance := 10 * time.Minute
+			if test.want == 3*time.Hour {
+				advance = 2 * time.Hour
+			}
+			f.now = start.Add(advance)
+			stored, err := session.readRecord()
+			if err != nil || !stored.ExpiresAt.Equal(first.ExpiresAt) {
+				t.Fatalf("read existing record: %v", err)
+			}
+			f.announcement.ExpiresAt = start.Add(4 * time.Hour)
+			f.responseUntil = start.Add(4 * time.Hour)
+			second, reused, err := session.authorize(context.Background(), f.announcement, f.endpoint, "", f.pair, f.keygen)
+			if err != nil || !reused || !second.ExpiresAt.Equal(first.ExpiresAt) || f.generated != 1 || f.approvals != 1 {
+				t.Fatalf("reuse changed deadline or approval: reused=%v err=%v generated=%d approvals=%d", reused, err, f.generated, f.approvals)
+			}
+			f.now = first.ExpiresAt
+			if _, err := session.readRecord(); !errors.Is(err, errSSHSessionExpired) {
+				t.Fatalf("exact expiry accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestSSHSessionCacheRejectsLifetimeBeyondShellLimit(t *testing.T) {
+	for _, test := range []struct {
+		name, shell string
+		limit       time.Duration
+	}{
+		{"Unix three hours", "posix", 3 * time.Hour},
+		{"Windows thirty minutes", "", 30 * time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newSSHSessionFixture(t)
+			f.announcement.Shell = test.shell
+			session := f.open(t)
+			record := f.authorize(t, session)
+			record.ExpiresAt = record.CreatedAt.Add(test.limit)
+			if err := session.save(record); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.readRecord(); err != nil {
+				t.Fatalf("exact shell limit rejected: %v", err)
+			}
+			record.ExpiresAt = record.ExpiresAt.Add(time.Nanosecond)
+			if err := session.save(record); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.readRecord(); err == nil {
+				t.Fatal("record beyond shell limit accepted")
+			}
+		})
+	}
+}
+
+func TestSSHSessionThreeHourUnixKeepsIdentityBindings(t *testing.T) {
+	for _, change := range []string{"host key", "account", "Shell"} {
+		t.Run(change, func(t *testing.T) {
+			f := newSSHSessionFixture(t)
+			f.announcement.Shell, f.announcement.Username = "posix", "macuser"
+			f.announcement.ExpiresAt = f.now.Add(3 * time.Hour)
+			f.responseUntil = f.announcement.ExpiresAt
+			session := f.open(t)
+			original := f.authorize(t, session)
+			f.now = f.now.Add(time.Hour)
+			selected := f.announcement
+			wantPairs := 1
+			switch change {
+			case "host key":
+				f.hostKey = sshTestPublicKey(3)
+				wantPairs = 2
+			case "account":
+				selected.Username = "MacUser"
+			case "Shell":
+				selected.Shell = ""
+			}
+			if _, _, err := session.authorize(context.Background(), selected, f.endpoint, "", f.pair, f.keygen); err == nil {
+				t.Fatal("changed Unix identity accepted")
+			}
+			stored, err := session.readRecord()
+			if err != nil || stored.HostKey != original.HostKey || stored.Username != original.Username || stored.Shell != original.Shell || !stored.ExpiresAt.Equal(original.ExpiresAt) || f.generated != 1 || len(f.pairRequests) != wantPairs {
+				t.Fatalf("failed binding check changed cached approval: err=%v generated=%d pairs=%d", err, f.generated, len(f.pairRequests))
+			}
+		})
+	}
+}
+
+func TestSSHSessionUncommittedStagingStillExpiresAtThirtyMinutes(t *testing.T) {
+	f := newSSHSessionFixture(t)
+	session := f.open(t)
+	if _, err := f.keygen(context.Background(), session.directory, "manager"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(session.directory, f.now, f.now); err != nil {
+		t.Fatal(err)
+	}
+	session.close()
+	start := f.now
+	f.now = start.Add(29 * time.Minute)
+	if err := f.cache.pruneExpired(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.privatePath()); err != nil {
+		t.Fatal("staging removed before its original deadline")
+	}
+	f.now = start.Add(30 * time.Minute)
+	if err := f.cache.pruneExpired(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unapproved staging retained beyond thirty minutes: %v", err)
 	}
 }
 
@@ -342,6 +481,92 @@ func TestSSHSessionPassesExactPairDeadlineToTarget(t *testing.T) {
 	}
 	if !f.pairRequests[0].ConfirmUntil.Equal(deadline) {
 		t.Fatalf("target confirmation deadline=%s want=%s", f.pairRequests[0].ConfirmUntil, deadline)
+	}
+}
+
+func TestSSHSessionPOSIXShellAndCaseSensitiveUsername(t *testing.T) {
+	f := newSSHSessionFixture(t)
+	f.announcement.Shell, f.announcement.Username = "posix", "macuser"
+	session := f.open(t)
+	first := f.authorize(t, session)
+	if first.Shell != "posix" || first.Username != "macuser" {
+		t.Fatalf("POSIX binding missing: %#v", first)
+	}
+	stored, err := session.readRecord()
+	if err != nil || stored.Shell != "posix" {
+		t.Fatalf("POSIX cache round trip: shell=%q err=%v", stored.Shell, err)
+	}
+	for _, mutation := range []string{"announcement casing", "override casing", "shell downgrade"} {
+		t.Run(mutation, func(t *testing.T) {
+			selected, override := f.announcement, ""
+			switch mutation {
+			case "announcement casing":
+				selected.Username = "MacUser"
+			case "override casing":
+				override = "MacUser"
+			case "shell downgrade":
+				selected.Shell = ""
+			}
+			_, _, err := session.authorize(context.Background(), selected, f.endpoint, override, f.pair, f.keygen)
+			if err == nil || len(f.pairRequests) != 1 {
+				t.Fatalf("changed binding err=%v pair count=%d", err, len(f.pairRequests))
+			}
+		})
+	}
+	_, reused, err := session.authorize(context.Background(), f.announcement, f.endpoint, "macuser", f.pair, f.keygen)
+	if err != nil || !reused || f.generated != 1 || f.approvals != 1 {
+		t.Fatalf("POSIX reuse=%v err=%v generated=%d approvals=%d", reused, err, f.generated, f.approvals)
+	}
+}
+
+func TestSSHSessionFirstPOSIXPairRejectsMismatchedResponse(t *testing.T) {
+	for _, mutation := range []string{"shell", "username casing"} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newSSHSessionFixture(t)
+			f.announcement.Shell, f.announcement.Username = "posix", "macuser"
+			session := f.open(t)
+			pair := func(ctx context.Context, request discovery.PairRequest) (discovery.PairResponse, error) {
+				response, err := f.pair(ctx, request)
+				if mutation == "shell" {
+					response.Shell = ""
+				} else {
+					response.Username = "MacUser"
+				}
+				return response, err
+			}
+			if _, _, err := session.authorize(context.Background(), f.announcement, f.endpoint, "", pair, f.keygen); err == nil {
+				t.Fatal("mismatched POSIX response accepted")
+			}
+			if _, err := os.Stat(session.privatePath()); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed POSIX pairing retained a key: %v", err)
+			}
+		})
+	}
+}
+
+func TestSSHSessionLegacyWindowsCacheOmitsShellAndKeepsCaseInsensitiveUser(t *testing.T) {
+	f := newSSHSessionFixture(t)
+	session := f.open(t)
+	record, _, err := session.authorize(context.Background(), f.announcement, f.endpoint, "remotebridge", f.pair, f.keygen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil || strings.Contains(string(data), `"shell"`) {
+		t.Fatalf("legacy cache changed: %s err=%v", data, err)
+	}
+}
+
+func TestSSHManageConflictingFlagsAreRejectedBeforeDiscovery(t *testing.T) {
+	for _, options := range [][]string{
+		{"--manage", "--command", "hostname"},
+		{"--manage", "--command", ""},
+		{"--manage", "--json"},
+		{"--manage", "--forget-session"},
+	} {
+		if code := runSSH(options); code != 2 {
+			t.Fatalf("options=%q code=%d", options, code)
+		}
 	}
 }
 
