@@ -320,3 +320,53 @@ func TestDiscoveryRemainsResponsiveDuringConsent(t *testing.T) {
 		t.Fatal("second pending confirmation was not safely rejected")
 	}
 }
+
+func TestDirectedBroadcastComputation(t *testing.T) {
+	cases := []struct {
+		ip   string
+		mask int
+		want string
+	}{
+		{"192.168.100.66", 24, "192.168.100.255"},
+		{"10.1.2.3", 8, "10.255.255.255"},
+		{"172.16.5.9", 20, "172.16.15.255"},
+	}
+	for _, c := range cases {
+		got := directedBroadcast(net.ParseIP(c.ip), net.CIDRMask(c.mask, 32))
+		if got == nil || got.String() != c.want {
+			t.Fatalf("directedBroadcast(%s/%d) = %v, want %s", c.ip, c.mask, got, c.want)
+		}
+	}
+	if directedBroadcast(net.ParseIP("192.168.0.1"), net.CIDRMask(32, 32)) != nil {
+		t.Fatal("/32 has no broadcast address")
+	}
+	if directedBroadcast(net.ParseIP("192.168.0.0"), net.CIDRMask(31, 32)) != nil {
+		t.Fatal("/31 has no broadcast address")
+	}
+}
+
+func TestBroadcastDestinationsPassThroughForDirectedAddress(t *testing.T) {
+	d := &net.UDPAddr{IP: net.ParseIP("192.168.100.255").To4(), Port: 37020}
+	got := broadcastDestinations(d)
+	if len(got) != 1 || !got[0].IP.Equal(d.IP) || got[0].Port != d.Port {
+		t.Fatalf("directed address should pass through unchanged, got %#v", got)
+	}
+}
+
+func TestBroadcastDestinationsExpandsLimitedBroadcast(t *testing.T) {
+	d := &net.UDPAddr{IP: net.IPv4bcast.To4(), Port: 37020}
+	got := broadcastDestinations(d)
+	if len(got) < 1 || !got[0].IP.Equal(net.IPv4bcast) {
+		t.Fatalf("limited broadcast must be kept first, got %#v", got)
+	}
+	seen := map[string]struct{}{}
+	for _, g := range got {
+		if g.Port != d.Port {
+			t.Fatalf("port not preserved: %#v", g)
+		}
+		if _, dup := seen[g.IP.String()]; dup {
+			t.Fatalf("duplicate destination: %s", g.IP)
+		}
+		seen[g.IP.String()] = struct{}{}
+	}
+}

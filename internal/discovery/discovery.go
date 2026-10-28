@@ -295,6 +295,91 @@ func ParseBroadcastAddress(address string, port int) (*net.UDPAddr, error) {
 	return &net.UDPAddr{IP: ip.To4(), Port: port}, nil
 }
 
+// broadcastDestinations expands the limited broadcast (255.255.255.255) into one
+// directed broadcast per local IPv4 subnet, so discovery reaches every attached
+// network on a multi-homed manager instead of only the single interface the OS
+// picks for a limited broadcast. The limited broadcast is kept first as a
+// fallback. Any other (already directed) address is used unchanged.
+func broadcastDestinations(destination *net.UDPAddr) []*net.UDPAddr {
+	if destination == nil {
+		return nil
+	}
+	if !destination.IP.Equal(net.IPv4bcast) {
+		return []*net.UDPAddr{destination}
+	}
+	targets := []*net.UDPAddr{destination}
+	seen := map[string]struct{}{destination.IP.String(): {}}
+	for _, b := range localDirectedBroadcasts() {
+		key := b.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, &net.UDPAddr{IP: b, Port: destination.Port})
+	}
+	return targets
+}
+
+// localDirectedBroadcasts returns the directed-broadcast address of each up,
+// broadcast-capable, non-loopback IPv4 interface that has a routable unicast
+// address. Failures to enumerate are treated as "no extra destinations" so the
+// caller still falls back to the limited broadcast.
+func localDirectedBroadcasts() []net.IP {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []net.IP
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagBroadcast == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			if b := directedBroadcast(ip4, ipnet.Mask); b != nil {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
+}
+
+// directedBroadcast computes the IPv4 directed-broadcast address for ip within
+// mask (host bits set to one). It returns nil for a non-IPv4 input, a malformed
+// mask, or a /31 or /32 that has no usable broadcast address.
+func directedBroadcast(ip net.IP, mask net.IPMask) net.IP {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil
+	}
+	if len(mask) == net.IPv6len {
+		mask = mask[12:]
+	}
+	if len(mask) != net.IPv4len {
+		return nil
+	}
+	ones, bits := mask.Size()
+	if bits != 32 || ones >= 31 {
+		return nil
+	}
+	b := make(net.IP, net.IPv4len)
+	for i := 0; i < net.IPv4len; i++ {
+		b[i] = ip4[i] | ^mask[i]
+	}
+	return b
+}
+
 // ServeResponder reads queries from conn and replies to each valid query's
 // source address. The caller owns conn; cancellation stops the loop without
 // closing it.
@@ -461,8 +546,21 @@ func Discover(ctx context.Context, conn *net.UDPConn, broadcastAddress string, p
 	if err := conn.SetWriteBuffer(MaxPacketSize); err != nil {
 		return nil, err
 	}
-	if _, err := conn.WriteToUDP(payload, destination); err != nil {
-		return nil, err
+	destinations := broadcastDestinations(destination)
+	sent := 0
+	var lastErr error
+	for _, d := range destinations {
+		if _, err := conn.WriteToUDP(payload, d); err != nil {
+			lastErr = err
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, errors.New("discovery: no broadcast destination available")
 	}
 
 	if _, ok := ctx.Deadline(); !ok {

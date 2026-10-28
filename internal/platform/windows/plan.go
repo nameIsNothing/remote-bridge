@@ -40,7 +40,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		pl.Warnings = append(pl.Warnings, "listener preparation may change an existing WinRM policy; review the dry-run and retain the original policy for rollback")
 	}
 	if normalized.CurrentUser {
-		pl.Warnings = append(pl.Warnings, "the plan uses the target wizard's current Windows account; it never creates, resets, or removes that account")
+		pl.Warnings = append(pl.Warnings, "the plan uses the target wizard's current Windows account; it never creates, resets, or removes that account, but it adds the account to Remote Management Users so WinRM can authenticate it, and removes that membership again on revoke when the plan was the one that added it")
 	}
 	if isLocalSubnetAddress(normalized.ManagementAddress) {
 		pl.Warnings = append(pl.Warnings, "the firewall source is LocalSubnet; any host on the target's local subnet may reach the temporary WinRM endpoint during this experiment")
@@ -94,6 +94,9 @@ func buildInspectSteps(o NormalizedOptions) []Action {
 		newAction("inspect.account", inspectAccountDescription(o), psCommand(inspectAccountScript(o), true), true, true),
 		newAction("inspect.network", "inspect local network profiles", psCommand(networkCheckScript(), true), true, true),
 	}
+	if o.CurrentUser {
+		steps = append(steps, newAction("inspect.current-user-winrm", "check whether the current account can authenticate over WinRM", psCommand(grantCurrentUserCheckScript(o), true), true, true))
+	}
 	if o.EnableDiscovery {
 		steps = append(steps, newAction("inspect.discovery-firewall", "inspect the plan-scoped UDP discovery firewall rule", psCommand(discoveryFirewallCheckScript(o), true), true, true))
 	}
@@ -114,7 +117,10 @@ func buildApplySteps(o NormalizedOptions) []Action {
 		steps = append(steps, newAction("apply.discovery-firewall", "create a source-restricted LAN discovery firewall rule", psCommand(discoveryFirewallApplyScript(o), false), false, true))
 	}
 	if o.CurrentUser {
-		steps = append(steps, newAction("apply.current-user", "verify the target wizard's current Windows account", psCommand(currentUserApplyScript(o), false), false, true))
+		steps = append(steps,
+			newAction("apply.current-user", "verify the target wizard's current Windows account", psCommand(currentUserApplyScript(o), false), false, true),
+			newAction("apply.current-user-group", "grant the current account WinRM access through Remote Management Users", psCommand(grantCurrentUserApplyScript(o), false), false, true),
+		)
 	} else {
 		steps = append(steps,
 			newAction("apply.account", "create or renew the temporary local maintenance account", psCommand(accountApplyScript(o), false), false, true),
@@ -126,7 +132,9 @@ func buildApplySteps(o NormalizedOptions) []Action {
 
 func buildRevokeSteps(o NormalizedOptions) []Action {
 	steps := make([]Action, 0, 3)
-	if !o.CurrentUser {
+	if o.CurrentUser {
+		steps = append(steps, newAction("revoke.current-user-group", "remove the Remote Management Users membership this plan granted", psCommand(grantCurrentUserRevokeScript(o), false), false, true))
+	} else {
 		steps = append(steps, newAction("revoke.account", "remove the plan-owned temporary account", psCommand(accountRevokeScript(o), false), false, true))
 	}
 	if o.EnableDiscovery {
@@ -287,6 +295,39 @@ func accountApplyScript(o NormalizedOptions) string {
 func accountGroupApplyScript(o NormalizedOptions) string {
 	user := psQuote(o.TemporaryUser)
 	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $u = Get-LocalUser -Name %s -ErrorAction Stop; $sid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-580'); $group = Get-LocalGroup -SID $sid -ErrorAction Stop; $members = @(Get-LocalGroupMember -Group $group.Name -ErrorAction SilentlyContinue); if (-not ($members | Where-Object { $_.SID -eq $u.SID })) { Add-LocalGroupMember -Group $group.Name -Member $u.Name }; [pscustomobject]@{ name = $u.Name; group = $group.Name; group_sid = [string]$group.SID } | ConvertTo-Json -Compress`, user)
+}
+
+// grantCurrentUserCheckScript reports, read-only, whether the wizard's current
+// account can already be used over WinRM. Administrators membership alone does
+// not guarantee access (UAC remote token filtering), so winrm_authorized tracks
+// the reliable signal: membership in Remote Management Users.
+func grantCurrentUserCheckScript(o NormalizedOptions) string {
+	principal := psQuote(o.CurrentUserPrincipal)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $id = [Security.Principal.WindowsIdentity]::GetCurrent(); $sid = [string]$id.User.Value; $expected = %s; $rmSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-580'); $adminSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'); $inRemote = $false; $inAdmin = $false; try { $g = Get-LocalGroup -SID $rmSid -ErrorAction Stop; $inRemote = [bool](@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue) | Where-Object { [string]$_.SID -eq $sid }) } catch {}; try { $a = Get-LocalGroup -SID $adminSid -ErrorAction Stop; $inAdmin = [bool](@(Get-LocalGroupMember -Group $a.Name -ErrorAction SilentlyContinue) | Where-Object { [string]$_.SID -eq $sid }) } catch {}; [pscustomobject]@{ principal = [string]$id.Name; sid = $sid; expected = $expected; in_remote_management_users = $inRemote; in_administrators = $inAdmin; winrm_authorized = $inRemote } | ConvertTo-Json -Compress`, principal)
+}
+
+// grantCurrentUserApplyScript adds the current account to Remote Management
+// Users so WinRM can authenticate it without weakening machine-wide UAC policy
+// (LocalAccountTokenFilterPolicy). It is idempotent: when the account is already
+// a member it changes nothing and records no ownership. When it adds the member
+// it writes a per-plan marker so revoke only removes a membership this plan
+// created. The identity is re-verified so an unexpected elevated account is
+// never granted access.
+func grantCurrentUserApplyScript(o NormalizedOptions) string {
+	principal := psQuote(o.CurrentUserPrincipal)
+	sid := psQuote(o.CurrentUserSID)
+	id := psQuote(o.ID)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $cur = [Security.Principal.WindowsIdentity]::GetCurrent(); $name = [string]$cur.Name; $sid = [string]$cur.User.Value; $expected = %s; $expectedSid = %s; if ($name -ine $expected) { throw "the elevated process identity does not match the target interactive account: $name" }; if (-not [string]::IsNullOrWhiteSpace($expectedSid) -and $sid -ne $expectedSid) { throw "the elevated process SID does not match the target interactive account: $sid" }; $rmSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-580'); $group = Get-LocalGroup -SID $rmSid -ErrorAction Stop; $accountSid = [System.Security.Principal.SecurityIdentifier]::new($sid); $already = [bool](@(Get-LocalGroupMember -Group $group.Name -ErrorAction SilentlyContinue) | Where-Object { [string]$_.SID -eq $sid }); $dir = Join-Path $env:ProgramData 'RemoteBridge'; $marker = Join-Path $dir ('winrm-group-' + %s + '.json'); $added = $false; if (-not $already) { Add-LocalGroupMember -Group $group.Name -Member $accountSid -ErrorAction Stop; New-Item -ItemType Directory -Force -Path $dir | Out-Null; ([pscustomobject]@{ sid = $sid; principal = $name; group_sid = [string]$group.SID }) | ConvertTo-Json -Compress | Set-Content -LiteralPath $marker -Encoding UTF8; $added = $true }; [pscustomobject]@{ principal = $name; sid = $sid; group = $group.Name; added = $added; already_member = $already } | ConvertTo-Json -Compress`, principal, sid, id)
+}
+
+// grantCurrentUserRevokeScript removes the Remote Management Users membership
+// only when a per-plan marker proves this plan granted it, then deletes the
+// marker. A missing marker, or a marker whose SID does not match this plan,
+// leaves membership untouched, so a pre-existing permission is never stripped.
+func grantCurrentUserRevokeScript(o NormalizedOptions) string {
+	sid := psQuote(o.CurrentUserSID)
+	id := psQuote(o.ID)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'; $marker = Join-Path (Join-Path $env:ProgramData 'RemoteBridge') ('winrm-group-' + %s + '.json'); if (-not (Test-Path -LiteralPath $marker)) { [pscustomobject]@{ removed = $false; reason = 'no plan-owned grant' } | ConvertTo-Json -Compress } else { $record = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json; $sid = [string]$record.sid; $expectedSid = %s; if (-not [string]::IsNullOrWhiteSpace($expectedSid) -and $sid -ne $expectedSid) { throw 'the recorded grant SID does not match this plan; group membership was left untouched' }; $rmSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-580'); $group = Get-LocalGroup -SID $rmSid -ErrorAction Stop; $accountSid = [System.Security.Principal.SecurityIdentifier]::new($sid); $member = @(Get-LocalGroupMember -Group $group.Name -ErrorAction SilentlyContinue) | Where-Object { [string]$_.SID -eq $sid }; if ($member) { Remove-LocalGroupMember -Group $group.Name -Member $accountSid -ErrorAction Stop }; Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue; [pscustomobject]@{ removed = $true; sid = $sid } | ConvertTo-Json -Compress }`, id, sid)
 }
 
 func accountRevokeScript(o NormalizedOptions) string {

@@ -78,6 +78,14 @@ func (b *winrmDesktopBackend) Check(ctx context.Context) ([]guiCheck, error) {
 	}
 	checks = append(checks, accountCheck)
 
+	authCheck := guiCheck{Name: "WinRM 远程授权", Status: "正常", Detail: "当前账号已在 Remote Management Users，可被管理端远程连接"}
+	if authorized, authErr := currentUserWinRMAuthorized(ctx); authErr != nil {
+		authCheck.Status, authCheck.Detail = "待配置", "点击开始后将把当前账号加入 Remote Management Users，结束连接时移除"
+	} else if !authorized {
+		authCheck.Status, authCheck.Detail = "待配置", "当前账号暂无 WinRM 远程权限；点击开始后将加入 Remote Management Users，结束连接时移除"
+	}
+	checks = append(checks, authCheck)
+
 	probe, probeErr := readWinRMGUIProbe(ctx)
 	adminCheck := guiCheck{Name: "管理员权限", Status: "正常", Detail: "已获得配置 WinRM 服务和局域网规则的权限"}
 	if probeErr != nil {
@@ -117,6 +125,28 @@ func (b *winrmDesktopBackend) Check(ctx context.Context) ([]guiCheck, error) {
 	}
 	checks = append(checks, resources)
 	return checks, nil
+}
+
+// currentUserWinRMAuthorized reports whether the current account is a member of
+// Remote Management Users, the reliable signal that WinRM will authenticate it.
+// It is read-only and may run before elevation; a read failure is surfaced by
+// the caller as "待配置" rather than treated as "not authorized".
+func currentUserWinRMAuthorized(ctx context.Context) (bool, error) {
+	script := `$ErrorActionPreference = 'Stop'; $sid = [string]([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value; $rmSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-580'); $g = Get-LocalGroup -SID $rmSid -ErrorAction Stop; $inRemote = [bool](@(Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue) | Where-Object { [string]$_.SID -eq $sid }); [pscustomobject]@{ in_remote_management_users = $inRemote } | ConvertTo-Json -Compress`
+	result, err := windows.NewRunner().Run(ctx, windows.PowerShellCommand(script, true))
+	if err != nil || result.ExitCode != 0 {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("读取 WinRM 远程授权失败，退出码 %d", result.ExitCode)
+	}
+	var parsed struct {
+		InRemoteManagementUsers bool `json:"in_remote_management_users"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &parsed); err != nil {
+		return false, err
+	}
+	return parsed.InRemoteManagementUsers, nil
 }
 
 func readWinRMGUIProbe(ctx context.Context) (winrmProbe, error) {

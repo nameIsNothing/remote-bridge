@@ -249,3 +249,78 @@ func TestDiscoveryFirewallIsOptInAndOwned(t *testing.T) {
 		t.Fatalf("discovery port drift: windows=%d protocol=%d", DefaultDiscoveryPort, discovery.DefaultPort)
 	}
 }
+
+func TestCurrentUserGrantsAndRevokesRemoteManagementMembership(t *testing.T) {
+	plan, err := BuildPlan(PlanOptions{
+		ID: "cu-grant", ManagementAddress: LocalSubnet, AllowHTTP: true,
+		CurrentUser: true, CurrentUserPrincipal: `DESKTOP-TEST\1`,
+		CurrentUserSID: "S-1-5-21-13496891-1894220995-2913726431-1001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var applyScript, revokeScript, inspectScript string
+	for _, action := range plan.ApplySteps {
+		if action.ID == "apply.current-user-group" {
+			applyScript = action.Command.String()
+		}
+		if action.ID == "apply.account" || action.ID == "apply.account-group" {
+			t.Fatalf("current-user plan unexpectedly manages a temporary account: %s", action.ID)
+		}
+	}
+	for _, action := range plan.RevokeSteps {
+		if action.ID == "revoke.current-user-group" {
+			revokeScript = action.Command.String()
+		}
+	}
+	for _, action := range plan.Inspect {
+		if action.ID == "inspect.current-user-winrm" {
+			inspectScript = action.Command.String()
+		}
+	}
+	if applyScript == "" || revokeScript == "" || inspectScript == "" {
+		t.Fatalf("current-user authorization steps missing: apply=%q revoke=%q inspect=%q", applyScript, revokeScript, inspectScript)
+	}
+
+	if !strings.Contains(applyScript, "S-1-5-32-580") {
+		t.Fatal("grant does not target the Remote Management Users group SID")
+	}
+	if !strings.Contains(applyScript, "Add-LocalGroupMember") || !strings.Contains(applyScript, "$already") {
+		t.Fatal("grant is not an idempotent Remote Management Users add")
+	}
+	if !strings.Contains(applyScript, "winrm-group-' + 'cu-grant'") {
+		t.Fatalf("grant does not write a per-plan ownership marker: %s", applyScript)
+	}
+	if !strings.Contains(applyScript, "does not match the target interactive account") {
+		t.Fatal("grant does not re-verify the elevated identity before adding the account")
+	}
+	if strings.Contains(applyScript, "LocalAccountTokenFilterPolicy") {
+		t.Fatal("grant must not weaken machine-wide UAC token policy")
+	}
+
+	if !strings.Contains(revokeScript, "Test-Path -LiteralPath $marker") || !strings.Contains(revokeScript, "no plan-owned grant") {
+		t.Fatal("revoke does not gate removal on the per-plan ownership marker")
+	}
+	if !strings.Contains(revokeScript, "Remove-LocalGroupMember") {
+		t.Fatal("revoke does not remove the granted membership")
+	}
+	if !strings.Contains(revokeScript, "does not match this plan") {
+		t.Fatal("revoke does not protect a pre-existing membership from another plan's SID")
+	}
+
+	if !strings.Contains(inspectScript, "winrm_authorized") {
+		t.Fatal("inspect does not report WinRM authorization")
+	}
+
+	var warned bool
+	for _, warning := range plan.Warnings {
+		if strings.Contains(warning, "Remote Management Users") {
+			warned = true
+			break
+		}
+	}
+	if !warned {
+		t.Fatal("current-user plan does not disclose the Remote Management Users grant")
+	}
+}
